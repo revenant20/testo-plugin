@@ -66,7 +66,7 @@ class TestoMutationRerunSelectedAction : TestoMutationAction() {
     }
 
     override fun isEnabled(panel: TestoMutationPanel) =
-        !panel.run.isBusy && panel.run.recipe != null && panel.selectedForRerun().any { it.finished }
+        !panel.run.holdsProcess && panel.run.recipe != null && panel.selectedForRerun().any { it.finished }
 
     override fun perform(panel: TestoMutationPanel) =
         TestoMutationService.getInstance(panel.project).rerun(panel.run, panel.selectedForRerun())
@@ -76,18 +76,19 @@ class TestoMutationRerunSelectedAction : TestoMutationAction() {
 class TestoMutationApplyAction : TestoMutationAction() {
     override fun isEnabled(panel: TestoMutationPanel): Boolean {
         val mutant = panel.selectedMutants().singleOrNull() ?: return false
-        return TestoMutationApply.isApplied(panel.run, mutant) || TestoMutationApply.canApply(panel.run, mutant)
+        return TestoMutationApply.isApplied(panel.project, panel.run, mutant) ||
+            TestoMutationApply.canApply(panel.project, panel.run, mutant)
     }
 
     override fun updatePresentation(e: AnActionEvent, panel: TestoMutationPanel) {
-        val applied = panel.selectedMutants().singleOrNull()?.let { TestoMutationApply.isApplied(panel.run, it) } == true
+        val applied = panel.selectedMutants().singleOrNull()?.let { TestoMutationApply.isApplied(panel.project, panel.run, it) } == true
         e.presentation.text = TestoBundle.message(if (applied) "infection.revert.action" else "infection.apply.action")
         e.presentation.icon = if (applied) AllIcons.Actions.Rollback else AllIcons.Actions.Edit
     }
 
     override fun perform(panel: TestoMutationPanel) {
         val mutant = panel.selectedMutants().singleOrNull() ?: return
-        if (TestoMutationApply.isApplied(panel.run, mutant)) TestoMutationApply.revert(panel.project, panel.run, mutant)
+        if (TestoMutationApply.isApplied(panel.project, panel.run, mutant)) TestoMutationApply.revert(panel.project, panel.run, mutant)
         else TestoMutationApply.apply(panel.project, panel.run, mutant)
     }
 }
@@ -112,7 +113,7 @@ class TestoMutationRerunEscapedAction : TestoMutationAction() {
     private fun escaped(panel: TestoMutationPanel) = panel.run.mutants.filter { it.status == MutantStatus.ESCAPED }
 
     override fun isEnabled(panel: TestoMutationPanel) =
-        !panel.run.isBusy && panel.run.recipe != null && escaped(panel).isNotEmpty()
+        !panel.run.holdsProcess && panel.run.recipe != null && escaped(panel).isNotEmpty()
 
     override fun perform(panel: TestoMutationPanel) =
         TestoMutationService.getInstance(panel.project).rerun(panel.run, escaped(panel))
@@ -123,7 +124,7 @@ class TestoMutationStopAction : TestoMutationAction() {
         templatePresentation.icon = AllIcons.Actions.Suspend
     }
 
-    override fun isEnabled(panel: TestoMutationPanel) = panel.run.isBusy
+    override fun isEnabled(panel: TestoMutationPanel) = panel.run.isRunning || panel.run.rerunning || panel.run.stopper != null
 
     override fun perform(panel: TestoMutationPanel) = panel.run.stop()
 }

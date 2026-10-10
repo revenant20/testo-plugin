@@ -1,9 +1,15 @@
 package com.github.xepozz.testo.infection
 
+import com.github.xepozz.testo.TestoBundle
+import com.github.xepozz.testo.php.TestoPreparedTool
+import com.github.xepozz.testo.runs.TestoRunStore
+import com.intellij.execution.ExecutionException
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -147,6 +153,241 @@ class TestoMutationArchiveTest {
         assertEquals(1, entry.escaped)
         assertEquals(TestoMutationArchive.load(testoRun, dir)!!.score().msi, entry.msi)
         assertFalse(entry.running)
+    }
+
+    @Test
+    fun `a stopped rerun is preserved without changing the main run outcome`() {
+        val testoRun = temp.newFolder("run").toPath()
+        val dir = record(testoRun, 1000)
+        val run = TestoMutationArchive.load(testoRun, dir)!!
+        run.rerunning = true
+        run.stop()
+        run.rerunning = false
+        TestoMutationArchive.writeSummary(dir, run)
+
+        val restored = TestoMutationArchive.load(testoRun, dir)!!
+        assertTrue(restored.rerunStopRequested)
+        assertFalse(restored.stopRequested)
+        assertEquals(0, restored.exitCode)
+        assertTrue(TestoMutationHistoryEntry.of(dir, TestoMutationArchive.summary(dir)!!).stopped)
+    }
+
+    @Test
+    fun `an unconfirmed run blocks nothing after reload and keeps its inputs for the grace period`() {
+        val source = temp.newFolder("unconfirmed").toPath()
+        val dir = record(source, 1000)
+        val run = TestoMutationArchive.load(source, dir)!!
+        val stoppedAt = System.currentTimeMillis()
+        run.restore(1000, stoppedAt, null, false, 19, failureReason = "transport lost", unconfirmedReason = "transport lost")
+        TestoMutationArchive.writeSummary(dir, run)
+        val restored = TestoMutationArchive.load(source, dir)!!
+        assertFalse(restored.isBusy)
+        assertFalse(restored.holdsProcess)
+        assertEquals("transport lost", restored.failureReason)
+        assertEquals(dir, TestoMutationArchive.unconfirmedRun(source))
+        TestoMutationArchive.prune(source, keep = 0)
+        assertTrue(Files.isDirectory(dir))
+
+        restored.restore(1000, stoppedAt - TestoRunStore.INCOMPLETE_GRACE_MS - 1, null, false, 19,
+            failureReason = "transport lost", unconfirmedReason = "transport lost")
+        TestoMutationArchive.writeSummary(dir, restored)
+        assertNull(TestoMutationArchive.unconfirmedRun(source))
+        TestoMutationArchive.prune(source, keep = 0)
+        assertFalse(Files.isDirectory(dir))
+    }
+
+    @Test
+    fun `a rerun stop that went unconfirmed is timed from the stop, not from when the run finished`() {
+        val source = temp.newFolder("rerun-unconfirmed").toPath()
+        val dir = record(source, 1000)
+        val run = TestoMutationArchive.load(source, dir)!!
+        run.restore(1000, System.currentTimeMillis() - TestoRunStore.INCOMPLETE_GRACE_MS - 1, 0, false, 19)
+        val tool = TestoPreparedTool("php infection", { error("must not start") })
+        run.pendingTool = tool
+        run.markUnconfirmed(tool, "transport lost")
+        TestoMutationArchive.writeSummary(dir, run)
+
+        val restored = TestoMutationArchive.load(source, dir)!!
+        assertTrue(restored.unconfirmedAt > 0)
+        assertEquals(dir, TestoMutationArchive.unconfirmedRun(source))
+        TestoMutationArchive.prune(source, keep = 0)
+        assertTrue(Files.isDirectory(dir))
+    }
+
+    @Test
+    fun `a summary without the unconfirmed time falls back to when the run finished`() {
+        val source = temp.newFolder("legacy-unconfirmed").toPath()
+        val dir = record(source, 1000)
+        val run = TestoMutationArchive.load(source, dir)!!
+        run.restore(1000, System.currentTimeMillis() - TestoRunStore.INCOMPLETE_GRACE_MS - 1, null, false, 19,
+            failureReason = "transport lost", unconfirmedReason = "transport lost", unconfirmedAt = System.currentTimeMillis())
+        TestoMutationArchive.writeSummary(dir, run)
+        val summary = dir.resolve(TestoMutationArchive.SUMMARY_FILE)
+        val legacy = Files.readString(summary).replace(Regex("\"unconfirmedAt\":\\d+,"), "")
+        assertFalse(legacy.contains("unconfirmedAt"))
+        Files.writeString(summary, legacy)
+
+        assertNull(TestoMutationArchive.unconfirmedRun(source))
+        TestoMutationArchive.prune(source, keep = 0)
+        assertFalse(Files.isDirectory(dir))
+    }
+
+    @Test
+    fun `a confirmed late stop preserves the failed observation after reload`() {
+        val source = temp.newFolder("confirmed").toPath()
+        val dir = record(source, 1000)
+        val run = TestoMutationArchive.load(source, dir)!!
+        run.restore(1000, 2000, null, false, 19, failureReason = "transport lost")
+        TestoMutationArchive.writeSummary(dir, run)
+        val restored = TestoMutationArchive.load(source, dir)!!
+        assertFalse(restored.isBusy)
+        assertEquals("transport lost", restored.failureReason)
+        assertNull(TestoMutationArchive.unconfirmedRun(source))
+    }
+
+    @Test
+    fun `retention fails closed for a fresh run with an unreadable or missing summary`() {
+        for ((index, content) in listOf("", "{", "{}", null).withIndex()) {
+            val source = temp.newFolder("bad-$index").toPath()
+            val dir = Files.createDirectories(source.resolve("infection/${System.currentTimeMillis()}"))
+            val input = Files.writeString(Files.createDirectories(dir.resolve("coverage")).resolve("junit.xml"), "input")
+            if (content != null) Files.writeString(dir.resolve(TestoMutationArchive.SUMMARY_FILE), content)
+            TestoMutationArchive.prune(source, keep = 0)
+            assertTrue(Files.exists(input))
+            assertFalse(TestoMutationArchive.deleteRunIfSafe(source))
+            assertTrue(Files.exists(input))
+        }
+    }
+
+    @Test
+    fun `a run without a finished summary stops pinning its Testo run after the grace period`() {
+        for ((index, content) in listOf("", "{", "{}", null).withIndex()) {
+            val source = temp.newFolder("stale-$index").toPath()
+            val dir = Files.createDirectories(source.resolve("infection/1000"))
+            Files.writeString(dir.resolve(TestoMutationArchive.STREAM_FILE), "$ php vendor/bin/infection")
+            if (content != null) Files.writeString(dir.resolve(TestoMutationArchive.SUMMARY_FILE), content)
+            assertTrue(TestoMutationArchive.deleteRunIfSafe(source))
+            assertFalse(Files.exists(source))
+        }
+    }
+
+    @Test
+    fun `active inputs protect a previously successful archive until every owner releases`() {
+        val source = temp.newFolder("leased").toPath()
+        val dir = record(source, 1000)
+        val input = Files.writeString(Files.createDirectories(dir.resolve("reruns/2000/coverage")).resolve("junit.xml"), "input")
+        val first = TestoMutationArchive.protectInputs(dir.resolve("reruns/2000"))
+        val second = TestoMutationArchive.protectInputs(dir.resolve("reruns/2000"))
+        try {
+            TestoMutationArchive.prune(source, keep = 0)
+            assertFalse(TestoMutationArchive.deleteRunIfSafe(source))
+            first.close()
+            first.close()
+            assertFalse(TestoMutationArchive.deleteRunIfSafe(source))
+            assertTrue(Files.exists(input))
+        } finally { first.close(); second.close() }
+        assertTrue(TestoMutationArchive.deleteRunIfSafe(source))
+        assertFalse(Files.exists(source))
+    }
+
+    @Test
+    fun `a run claimed for deletion takes no new inputs and is deleted once`() {
+        val source = temp.newFolder("claimed").toPath()
+        val dir = record(source, 1000)
+
+        assertTrue(TestoMutationArchive.claimForDeletion(source))
+        assertFalse(TestoMutationArchive.claimForDeletion(source))
+        assertFalse(TestoMutationArchive.deleteRunIfSafe(source))
+        assertThrows(ExecutionException::class.java) { TestoMutationArchive.protectInputs(dir.resolve("reruns/2000")) }
+        assertNotNull(TestoMutationArchive.summary(dir))
+
+        TestoMutationArchive.deleteClaimed(source)
+        assertFalse(Files.exists(source))
+        record(source, 2000)
+        TestoMutationArchive.protectInputs(source.resolve("infection/2000")).close()
+        assertTrue(TestoMutationArchive.deleteRunIfSafe(source))
+    }
+
+    @Test
+    fun `a summary write into a run claimed for deletion writes nothing`() {
+        val source = temp.newFolder("claimed-summary").toPath()
+        val dir = record(source, 1000)
+        val run = TestoMutationArchive.load(source, dir)!!
+        val summary = dir.resolve(TestoMutationArchive.SUMMARY_FILE)
+
+        assertTrue(TestoMutationArchive.claimForDeletion(source))
+        Files.delete(summary)
+        TestoMutationArchive.writeSummary(dir, run)
+        assertFalse(Files.exists(summary))
+        assertEquals(0L, Files.list(dir).use { paths -> paths.filter { it.fileName.toString().endsWith(".tmp") }.count() })
+
+        TestoMutationArchive.deleteClaimed(source)
+        assertFalse(Files.exists(source))
+        TestoMutationArchive.writeSummary(dir, run)
+        assertFalse(Files.exists(source))
+    }
+
+    @Test
+    fun `input protection taken before the run directory exists keeps the Testo run from being claimed`() {
+        val source = temp.newFolder("protected-first").toPath()
+        record(source, 1000)
+        val dir = TestoMutationArchive.newRunDir(source, 2000)
+
+        val protection = TestoMutationArchive.protectRunInputs(source, dir)
+        assertFalse(Files.exists(dir))
+        assertFalse(TestoMutationArchive.claimForDeletion(source))
+        protection.close()
+
+        assertTrue(TestoMutationArchive.claimForDeletion(source))
+        TestoMutationArchive.deleteClaimed(source)
+        assertFalse(Files.exists(source))
+    }
+
+    @Test
+    fun `inputs of a Testo run already deleted are refused`() {
+        val source = temp.root.toPath().resolve("deleted")
+
+        val error = assertThrows(ExecutionException::class.java) {
+            TestoMutationArchive.protectRunInputs(source, TestoMutationArchive.newRunDir(source, 1000))
+        }
+        assertEquals(TestoBundle.message("infection.error.runDeleted"), error.message)
+        assertFalse(Files.exists(source))
+        assertTrue(TestoMutationArchive.deleteRunIfSafe(Files.createDirectories(source)))
+    }
+
+    @Test
+    fun `input protection covers preparation before the first summary exists`() {
+        val source = temp.newFolder("preparing").toPath()
+        val dir = source.resolve("infection/1000")
+        TestoMutationArchive.protectInputs(dir).use {
+            assertFalse(TestoMutationArchive.deleteRunIfSafe(source))
+            assertTrue(Files.exists(source))
+        }
+        assertTrue(TestoMutationArchive.deleteRunIfSafe(source))
+    }
+
+    @Test
+    fun `summary replacement leaves no temporary files or partially published document`() {
+        val source = temp.newFolder("replace").toPath()
+        val dir = record(source, 1000)
+        val run = TestoMutationArchive.load(source, dir)!!
+        repeat(5) {
+            run.restore(1000, 2000, null, false, 19, failureReason = "transport lost", unconfirmedReason = "transport lost")
+            TestoMutationArchive.writeSummary(dir, run)
+            assertEquals("transport lost", TestoMutationArchive.summary(dir)!!.unconfirmedReason)
+            assertEquals(0L, Files.list(dir).use { paths -> paths.filter { it.fileName.toString().endsWith(".tmp") }.count() })
+        }
+    }
+
+    @Test
+    fun `an archive without the rerun flag keeps its original outcome`() {
+        val testoRun = temp.newFolder("run").toPath()
+        val dir = record(testoRun, 1000)
+        val summary = dir.resolve(TestoMutationArchive.SUMMARY_FILE)
+        Files.writeString(summary, Files.readString(summary).replace("\"rerunStopped\":false,", ""))
+        val restored = TestoMutationArchive.load(testoRun, dir)!!
+        assertFalse(restored.rerunStopRequested)
+        assertEquals(0, restored.exitCode)
     }
 
     @Test
